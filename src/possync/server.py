@@ -15,7 +15,8 @@ from psycopg import sql
 
 @dataclass(frozen=True)
 class TableSpec:
-    """Columns a node replicates for a table. `stock` is never one of them."""
+    """Columns a node replicates for a table. `stock` is never one of them:
+    it only moves through stock deltas."""
 
     name: str
     columns: tuple[str, ...]
@@ -43,7 +44,7 @@ def init_schema(conn: psycopg.Connection) -> None:
 def reset_schema(conn: psycopg.Connection) -> None:
     """Drop everything (tests and the demo start from a clean server)."""
     with conn.transaction():
-        conn.execute("DROP TABLE IF EXISTS products, sales CASCADE")
+        conn.execute("DROP TABLE IF EXISTS products, sales, applied_ops CASCADE")
     init_schema(conn)
 
 
@@ -73,6 +74,13 @@ def apply_batch(conn: psycopg.Connection, node_id: str, ops: list[dict]) -> list
 
 def _apply_one(conn: psycopg.Connection, node_id: str, op: dict) -> str:
     kind = op["kind"]
+    if kind == "delta":
+        row = conn.execute(
+            "SELECT apply_stock_delta(%s::uuid, %s::uuid, %s::bigint, %s::text) AS status",
+            (op["op_id"], op["row_id"], op["payload"]["delta"], node_id),
+        ).fetchone()
+        return row["status"]
+
     spec = TABLES[op["table"]]
     if kind == "upsert":
         return _upsert(conn, spec, op["payload"], node_id)

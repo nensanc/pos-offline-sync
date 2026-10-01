@@ -3,7 +3,8 @@
 -- Rules this schema enforces:
 --   * `updated_at` is always set by the server (clock_timestamp()), never by a
 --     client.
---   * Upserts never write `products.stock`.
+--   * `products.stock` only changes through apply_stock_delta(). Upserts never
+--     write it, which is what lets concurrent sales on different nodes add up.
 
 CREATE TABLE IF NOT EXISTS products (
     id          uuid PRIMARY KEY,
@@ -29,6 +30,14 @@ CREATE TABLE IF NOT EXISTS sales (
     updated_at       timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 
+-- Ids of stock deltas already applied. Makes apply_stock_delta() idempotent:
+-- a retried delta (for example after a lost acknowledgement) is not applied twice.
+CREATE TABLE IF NOT EXISTS applied_ops (
+    op_id      uuid PRIMARY KEY,
+    node_id    text        NOT NULL,
+    applied_at timestamptz NOT NULL DEFAULT clock_timestamp()
+);
+
 CREATE INDEX IF NOT EXISTS ix_products_updated   ON products   (updated_at, id);
 CREATE INDEX IF NOT EXISTS ix_sales_updated      ON sales      (updated_at, id);
 
@@ -49,4 +58,33 @@ BEGIN
         EXECUTE format('CREATE TRIGGER trg_%1$s_touch BEFORE INSERT OR UPDATE ON %1$s
                         FOR EACH ROW EXECUTE FUNCTION possync_touch()', t);
     END LOOP;
+END $$;
+
+-- Apply a stock delta exactly once.
+--   'applied'    the delta was added to the stock
+--   'duplicate'  this op_id was already applied (retry after a lost ack)
+-- Raises if the product does not exist yet, so the node retries later (its
+-- create may still be in flight) and eventually parks the item.
+CREATE OR REPLACE FUNCTION apply_stock_delta(
+    p_op_id      uuid,
+    p_product_id uuid,
+    p_delta      bigint,
+    p_node_id    text
+) RETURNS text
+LANGUAGE plpgsql AS $$
+BEGIN
+    INSERT INTO applied_ops (op_id, node_id) VALUES (p_op_id, p_node_id)
+    ON CONFLICT (op_id) DO NOTHING;
+    IF NOT FOUND THEN
+        RETURN 'duplicate';
+    END IF;
+
+    UPDATE products SET stock = stock + p_delta WHERE id = p_product_id;
+    IF FOUND THEN
+        RETURN 'applied';
+    END IF;
+
+    -- Undo the applied_ops insert (the whole call runs in the caller's savepoint).
+    RAISE EXCEPTION 'product % does not exist on the server', p_product_id
+        USING ERRCODE = 'foreign_key_violation';
 END $$;
