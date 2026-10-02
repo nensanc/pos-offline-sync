@@ -199,6 +199,15 @@ class Node:
             )
             self.enqueue("delta", "products", product_id, {"delta": quantity})
 
+    # ── Applying server state ─────────────────────────────────
+
+    def apply_tombstone(self, table: str, row_id: str) -> bool:
+        """Apply a deletion made elsewhere. Deletes win over unsent local edits:
+        the server rejects those edits as 'tombstoned', so keeping the row here
+        would leave this node diverged forever."""
+        cur = self.db.execute(f"DELETE FROM {table} WHERE id = ?", (row_id,))
+        return cur.rowcount > 0
+
     # ── Reads ─────────────────────────────────────────────────
 
     def stock(self, product_id: str) -> int | None:

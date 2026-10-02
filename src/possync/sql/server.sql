@@ -30,6 +30,17 @@ CREATE TABLE IF NOT EXISTS sales (
     updated_at       timestamptz NOT NULL DEFAULT clock_timestamp()
 );
 
+-- Tombstones: durable records of deletions. A node that was offline when a row
+-- was deleted learns about it here, and reconciliation uses them so a deleted
+-- row is never resurrected by a node that still has a copy.
+CREATE TABLE IF NOT EXISTS tombstones (
+    table_name text        NOT NULL,
+    row_id     uuid        NOT NULL,
+    origin     text,
+    deleted_at timestamptz NOT NULL DEFAULT clock_timestamp(),
+    PRIMARY KEY (table_name, row_id)
+);
+
 -- Ids of stock deltas already applied. Makes apply_stock_delta() idempotent:
 -- a retried delta (for example after a lost acknowledgement) is not applied twice.
 CREATE TABLE IF NOT EXISTS applied_ops (
@@ -40,6 +51,7 @@ CREATE TABLE IF NOT EXISTS applied_ops (
 
 CREATE INDEX IF NOT EXISTS ix_products_updated   ON products   (updated_at, id);
 CREATE INDEX IF NOT EXISTS ix_sales_updated      ON sales      (updated_at, id);
+CREATE INDEX IF NOT EXISTS ix_tombstones_deleted ON tombstones (deleted_at, row_id);
 
 -- Server-assigned modification time.
 CREATE OR REPLACE FUNCTION possync_touch() RETURNS trigger
@@ -63,6 +75,7 @@ END $$;
 -- Apply a stock delta exactly once.
 --   'applied'    the delta was added to the stock
 --   'duplicate'  this op_id was already applied (retry after a lost ack)
+--   'tombstoned' the product was deleted; the delta has nothing to apply to
 -- Raises if the product does not exist yet, so the node retries later (its
 -- create may still be in flight) and eventually parks the item.
 CREATE OR REPLACE FUNCTION apply_stock_delta(
@@ -82,6 +95,11 @@ BEGIN
     UPDATE products SET stock = stock + p_delta WHERE id = p_product_id;
     IF FOUND THEN
         RETURN 'applied';
+    END IF;
+
+    IF EXISTS (SELECT 1 FROM tombstones
+               WHERE table_name = 'products' AND row_id = p_product_id) THEN
+        RETURN 'tombstoned';
     END IF;
 
     -- Undo the applied_ops insert (the whole call runs in the caller's savepoint).

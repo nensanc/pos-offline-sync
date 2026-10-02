@@ -44,7 +44,7 @@ def init_schema(conn: psycopg.Connection) -> None:
 def reset_schema(conn: psycopg.Connection) -> None:
     """Drop everything (tests and the demo start from a clean server)."""
     with conn.transaction():
-        conn.execute("DROP TABLE IF EXISTS products, sales, applied_ops CASCADE")
+        conn.execute("DROP TABLE IF EXISTS products, sales, tombstones, applied_ops CASCADE")
     init_schema(conn)
 
 
@@ -83,11 +83,18 @@ def _apply_one(conn: psycopg.Connection, node_id: str, op: dict) -> str:
 
     spec = TABLES[op["table"]]
     if kind == "upsert":
+        if _is_tombstoned(conn, spec.name, op["row_id"]):
+            return "tombstoned"  # deletes win: a stale edit cannot resurrect a row
         return _upsert(conn, spec, op["payload"], node_id)
     if kind == "delete":
         conn.execute(
             sql.SQL("DELETE FROM {} WHERE id = %s").format(sql.Identifier(spec.name)),
             (op["row_id"],),
+        )
+        conn.execute(
+            "INSERT INTO tombstones (table_name, row_id, origin) VALUES (%s, %s, %s) "
+            "ON CONFLICT (table_name, row_id) DO NOTHING",
+            (spec.name, op["row_id"], node_id),
         )
         return "applied"
     raise ValueError(f"unknown operation kind: {kind}")
@@ -124,6 +131,13 @@ def _upsert(conn: psycopg.Connection, spec: TableSpec, payload: dict, node_id: s
     )
     row = conn.execute(query, [payload[c] for c in cols] + [node_id]).fetchone()
     return "applied" if row else "unchanged"
+
+
+def _is_tombstoned(conn: psycopg.Connection, table: str, row_id: str) -> bool:
+    row = conn.execute(
+        "SELECT 1 FROM tombstones WHERE table_name = %s AND row_id = %s", (table, row_id)
+    ).fetchone()
+    return row is not None
 
 
 def _error_text(exc: psycopg.Error) -> str:
