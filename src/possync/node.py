@@ -18,6 +18,7 @@ from importlib import resources
 
 from .ids import new_id, seed_id, seed_op_id
 from .server import TABLES
+from .sync import SyncEngine
 from .transport import Link
 
 
@@ -38,8 +39,7 @@ class Node:
         self.db.execute("PRAGMA journal_mode=WAL")
         schema = resources.files("possync").joinpath("sql/node.sql").read_text(encoding="utf-8")
         self.db.executescript(schema)
-        self.batch_size = batch_size
-        self.max_attempts = max_attempts
+        self.sync = SyncEngine(self, link, batch_size=batch_size, max_attempts=max_attempts)
 
     def close(self) -> None:
         self.link.close()
@@ -224,6 +224,13 @@ class Node:
     def pending_count(self) -> int:
         row = self.db.execute("SELECT COUNT(*) AS n FROM outbox WHERE status = 'pending'")
         return int(row.fetchone()["n"])
+
+    def retry_parked(self) -> int:
+        """Put parked items back in the queue (after fixing their cause)."""
+        cur = self.db.execute(
+            "UPDATE outbox SET status = 'pending', attempts = 0 WHERE status = 'parked'"
+        )
+        return cur.rowcount
 
 
 def _now() -> str:
