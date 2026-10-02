@@ -1,24 +1,47 @@
-"""Sync engine: upload the outbox to the server.
+"""Sync engine: upload the outbox and download changes in three layers.
 
-The outbox is sent in batches, oldest first. Each item is retried until the
-server accepts it. A *data* error (the server answered, but rejected the
-item) counts as an attempt; after `max_attempts` the item is parked so it
-stops blocking the queue. A *network* error never counts: the item is fine,
-the network is not.
+Upload (push)
+    The outbox is sent in batches, oldest first. Each item is retried until the
+    server accepts it. A *data* error (the server answered, but rejected the
+    item) counts as an attempt; after `max_attempts` the item is parked so it
+    stops blocking the queue. A *network* error never counts: the item is fine,
+    the network is not.
+
+Download (pull), three layers from cheapest to most thorough
+    1. Notifications: the server pushes "table X, row Y changed". Fast, but best
+       effort: anything sent while the node was offline is lost.
+    2. Catch-up: per table, read everything changed since a watermark. The
+       watermark is always a server timestamp, so client clock skew is
+       irrelevant. Run on reconnect and periodically.
+    3. Reconciliation: compare full server state with local state. Heals
+       anything the other layers missed. Run on first start and on demand.
+
+Every download step pushes first: uploading local changes before reading
+remote ones means the server already includes them.
 """
 
 from __future__ import annotations
 
 import json
+from collections import defaultdict
 from dataclasses import dataclass, field
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
 
 from . import server
 from .errors import NetworkError
+from .server import NIL_UUID, REPLICATED_TABLES
 
 if TYPE_CHECKING:
     from .node import Node
     from .transport import Link
+
+# Re-read this far behind the watermark. A transaction that started before the
+# last catch-up but committed after it carries an older updated_at; the overlap
+# picks it up. Re-applying a row is harmless because applying is idempotent.
+CATCHUP_OVERLAP = timedelta(seconds=2)
+CATCHUP_PAGE = 500
+TOMBSTONES = "tombstones"
 
 
 @dataclass
@@ -29,6 +52,13 @@ class PushReport:
     parked: int = 0
     offline: bool = False
     statuses: dict[str, int] = field(default_factory=dict)
+
+
+@dataclass
+class ReconcileReport:
+    downloaded: int = 0
+    deleted: int = 0
+    reuploaded: int = 0
 
 
 class SyncEngine:
@@ -118,7 +148,169 @@ class SyncEngine:
             "UPDATE outbox SET status = ?, result = ? WHERE seq = ?", (status, result, item["seq"])
         )
 
+    # ── Download layer 1: notifications ───────────────────────
+
+    def listen(self) -> None:
+        self.link.listen()
+
+    def process_notifications(self, timeout: float = 0.05) -> int:
+        """Apply the rows that recent notifications pointed at."""
+        notes = self.link.drain_notifications(timeout)
+        if not notes:
+            return 0
+        changed: dict[str, set[str]] = defaultdict(set)
+        for note in notes:
+            changed[note["table"]].add(note["id"])
+        applied = 0
+        try:
+            for table in REPLICATED_TABLES:
+                ids = sorted(changed.get(table, ()))
+                if not ids:
+                    continue
+                rows = self.link.call(server.fetch_rows, table, ids)
+                missing = sorted(set(ids) - {r["id"] for r in rows})
+                gone = self.link.call(server.fetch_tombstones, table, missing) if missing else []
+                with self.node.tx():
+                    for row in rows:
+                        self.node.apply_remote_row(table, row)
+                    for row_id in gone:
+                        self.node.apply_tombstone(table, row_id)
+                applied += len(rows) + len(gone)
+        except NetworkError:
+            pass  # whatever was missed is picked up by the next catch-up
+        return applied
+
+    # ── Download layer 2: incremental catch-up ────────────────
+
+    def catch_up(self) -> int:
+        """Download everything changed since each table's watermark.
+
+        Falls back to a full reconciliation on a node that never synced (it has
+        no watermark yet).
+        """
+        self.push()
+        if any(self._watermark(t) is None for t in (*REPLICATED_TABLES, TOMBSTONES)):
+            report = self.reconcile()
+            return report.downloaded + report.deleted
+        applied = 0
+        try:
+            for table in REPLICATED_TABLES:
+                applied += self._catch_up_table(table)
+            applied += self._catch_up_tombstones()
+        except NetworkError:
+            pass
+        return applied
+
+    def _catch_up_table(self, table: str) -> int:
+        watermark = self._watermark(table)
+        cursor_ts, cursor_id = watermark - CATCHUP_OVERLAP, NIL_UUID
+        applied = 0
+        while True:
+            rows = self.link.call(server.changes_since, table, cursor_ts, cursor_id, CATCHUP_PAGE)
+            if not rows:
+                break
+            with self.node.tx():
+                for row in rows:
+                    self.node.apply_remote_row(table, row)
+                last = rows[-1]
+                cursor_ts, cursor_id = last["updated_at"], last["id"]
+                if cursor_ts > watermark:
+                    watermark = cursor_ts
+                    self._set_watermark(table, watermark)
+            applied += len(rows)
+            if len(rows) < CATCHUP_PAGE:
+                break
+        return applied
+
+    def _catch_up_tombstones(self) -> int:
+        watermark = self._watermark(TOMBSTONES)
+        cursor_ts, cursor_id = watermark - CATCHUP_OVERLAP, NIL_UUID
+        deleted = 0
+        while True:
+            rows = self.link.call(server.tombstones_since, cursor_ts, cursor_id, CATCHUP_PAGE)
+            if not rows:
+                break
+            with self.node.tx():
+                for row in rows:
+                    if self.node.apply_tombstone(row["table_name"], row["row_id"]):
+                        deleted += 1
+                last = rows[-1]
+                cursor_ts, cursor_id = last["deleted_at"], last["row_id"]
+                if cursor_ts > watermark:
+                    watermark = cursor_ts
+                    self._set_watermark(TOMBSTONES, watermark)
+            if len(rows) < CATCHUP_PAGE:
+                break
+        return deleted
+
+    # ── Download layer 3: full reconciliation ─────────────────
+
+    def reconcile(self) -> ReconcileReport:
+        """Make local state match the server, without losing local work.
+
+        * Server rows missing or outdated locally are applied (same rules as the
+          other layers: unsent local edits and deltas are preserved).
+        * Tombstoned rows are deleted locally and never re-uploaded.
+        * Local rows the server has never seen, with nothing pending, are
+          enqueued again: their upload was lost (for example a parked item that
+          was cleared), and reconciliation re-sends them.
+        """
+        report = ReconcileReport()
+        self.push()
+        snap = self.link.call(server.snapshot)
+        tombstoned: dict[str, set[str]] = defaultdict(set)
+        for t in snap["tombstones"]:
+            tombstoned[t["table_name"]].add(t["row_id"])
+
+        with self.node.tx():
+            for table in REPLICATED_TABLES:
+                for row_id in tombstoned[table]:
+                    if self.node.apply_tombstone(table, row_id):
+                        report.deleted += 1
+                remote_ids = set()
+                for row in snap["tables"][table]:
+                    remote_ids.add(row["id"])
+                    if self.node.apply_remote_row(table, row) in ("inserted", "updated"):
+                        report.downloaded += 1
+                local_ids = {
+                    r["id"] for r in self.node.db.execute(f"SELECT id FROM {table}").fetchall()
+                }
+                for row_id in sorted(local_ids - remote_ids - tombstoned[table]):
+                    if not self.node._pending_exists(table, row_id, ("upsert", "delete")):
+                        self.node.enqueue("upsert", table, row_id)
+                        report.reuploaded += 1
+
+            # Everything up to the snapshot is now applied. The catch-up overlap
+            # covers transactions that were still in flight when it was taken.
+            for key in (*REPLICATED_TABLES, TOMBSTONES):
+                self._set_watermark(key, snap["taken_at"])
+
+        if report.reuploaded:
+            self.push()
+        return report
+
     # ── Connectivity ──────────────────────────────────────────
 
     def go_offline(self) -> None:
         self.link.set_online(False)
+
+    def reconnect(self) -> int:
+        """Come back online: subscribe first, then catch up. In that order,
+        nothing can fall in the gap between the two."""
+        self.link.set_online(True)
+        self.listen()
+        return self.catch_up()
+
+    def sync_once(self) -> None:
+        """One routine cycle: upload, then apply notifications."""
+        self.push()
+        self.process_notifications()
+
+    # ── Watermarks ────────────────────────────────────────────
+
+    def _watermark(self, key: str) -> datetime | None:
+        value = self.node.get_state(f"watermark:{key}")
+        return datetime.fromisoformat(value) if value else None
+
+    def _set_watermark(self, key: str, value: datetime) -> None:
+        self.node.set_state(f"watermark:{key}", value.isoformat())

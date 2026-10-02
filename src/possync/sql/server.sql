@@ -2,9 +2,12 @@
 --
 -- Rules this schema enforces:
 --   * `updated_at` is always set by the server (clock_timestamp()), never by a
---     client.
+--     client. Nodes use it as their catch-up watermark, so client clock skew can
+--     never make a node skip changes.
 --   * `products.stock` only changes through apply_stock_delta(). Upserts never
 --     write it, which is what lets concurrent sales on different nodes add up.
+--   * Every write emits a notification on the `possync_changes` channel. It is a
+--     hint, not a guarantee: a node that is offline simply misses it.
 
 CREATE TABLE IF NOT EXISTS products (
     id          uuid PRIMARY KEY,
@@ -61,6 +64,24 @@ BEGIN
     RETURN NEW;
 END $$;
 
+-- Change notification (best effort).
+CREATE OR REPLACE FUNCTION possync_notify() RETURNS trigger
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_id uuid;
+BEGIN
+    IF TG_TABLE_NAME = 'tombstones' THEN
+        v_id := NEW.row_id;
+        PERFORM pg_notify('possync_changes',
+            json_build_object('table', NEW.table_name, 'id', v_id, 'op', 'DELETE')::text);
+    ELSE
+        v_id := COALESCE(NEW.id, OLD.id);
+        PERFORM pg_notify('possync_changes',
+            json_build_object('table', TG_TABLE_NAME, 'id', v_id, 'op', TG_OP)::text);
+    END IF;
+    RETURN NULL;
+END $$;
+
 DO $$
 DECLARE
     t text;
@@ -69,7 +90,13 @@ BEGIN
         EXECUTE format('DROP TRIGGER IF EXISTS trg_%1$s_touch ON %1$s', t);
         EXECUTE format('CREATE TRIGGER trg_%1$s_touch BEFORE INSERT OR UPDATE ON %1$s
                         FOR EACH ROW EXECUTE FUNCTION possync_touch()', t);
+        EXECUTE format('DROP TRIGGER IF EXISTS trg_%1$s_notify ON %1$s', t);
+        EXECUTE format('CREATE TRIGGER trg_%1$s_notify AFTER INSERT OR UPDATE ON %1$s
+                        FOR EACH ROW EXECUTE FUNCTION possync_notify()', t);
     END LOOP;
+    DROP TRIGGER IF EXISTS trg_tombstones_notify ON tombstones;
+    CREATE TRIGGER trg_tombstones_notify AFTER INSERT ON tombstones
+        FOR EACH ROW EXECUTE FUNCTION possync_notify();
 END $$;
 
 -- Apply a stock delta exactly once.

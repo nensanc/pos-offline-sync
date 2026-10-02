@@ -15,6 +15,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from importlib import resources
+from typing import Any
 
 from .ids import new_id, seed_id, seed_op_id
 from .server import TABLES
@@ -201,6 +202,43 @@ class Node:
 
     # ── Applying server state ─────────────────────────────────
 
+    def apply_remote_row(self, table: str, row: dict[str, Any]) -> str:
+        """Apply a row read from the server. Idempotent.
+
+        * A row with an unsent local edit or delete keeps the local version: that
+          change will reach the server and win there.
+        * Product stock is always server stock + this node's unconfirmed deltas,
+          so a local sale that has not been uploaded yet is never lost.
+        """
+        spec = TABLES[table]
+        row_id = row["id"]
+        local = self.db.execute(f"SELECT 1 FROM {table} WHERE id = ?", (row_id,)).fetchone()
+
+        if self._pending_exists(table, row_id, ("upsert", "delete")):
+            if table == "products" and local:
+                self.db.execute(
+                    "UPDATE products SET stock = ? WHERE id = ?",
+                    (int(row["stock"]) + self.pending_delta(row_id), row_id),
+                )
+            return "kept-local"
+
+        values = {c: row[c] for c in spec.columns}
+        values["updated_at"] = _iso(row["updated_at"])
+        if table == "products":
+            values["stock"] = int(row["stock"]) + self.pending_delta(row_id)
+
+        if local is None:
+            cols = ", ".join(values)
+            marks = ", ".join("?" * len(values))
+            self.db.execute(
+                f"INSERT INTO {table} ({cols}) VALUES ({marks})", tuple(values.values())
+            )
+            return "inserted"
+        sets = ", ".join(f"{c} = ?" for c in values if c != "id")
+        params = [v for c, v in values.items() if c != "id"] + [row_id]
+        self.db.execute(f"UPDATE {table} SET {sets} WHERE id = ?", params)
+        return "updated"
+
     def apply_tombstone(self, table: str, row_id: str) -> bool:
         """Apply a deletion made elsewhere. Deletes win over unsent local edits:
         the server rejects those edits as 'tombstoned', so keeping the row here
@@ -241,6 +279,23 @@ class Node:
         )
         return cur.rowcount
 
+    # ── Watermarks ────────────────────────────────────────────
+
+    def get_state(self, key: str) -> str | None:
+        row = self.db.execute("SELECT value FROM sync_state WHERE key = ?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    def set_state(self, key: str, value: str) -> None:
+        self.db.execute(
+            "INSERT INTO sync_state (key, value) VALUES (?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            (key, value),
+        )
+
 
 def _now() -> str:
     return datetime.now(UTC).isoformat()
+
+
+def _iso(value: Any) -> str | None:
+    return value.isoformat() if isinstance(value, datetime) else value

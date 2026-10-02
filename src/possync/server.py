@@ -6,11 +6,16 @@ directly; they go through `transport.Link`, which simulates the network.
 
 from __future__ import annotations
 
+import uuid
 from dataclasses import dataclass
+from datetime import datetime
 from importlib import resources
+from typing import Any
 
 import psycopg
 from psycopg import sql
+
+NIL_UUID = "00000000-0000-0000-0000-000000000000"
 
 
 @dataclass(frozen=True)
@@ -144,6 +149,89 @@ def _error_text(exc: psycopg.Error) -> str:
     diag = getattr(exc, "diag", None)
     primary = diag.message_primary if diag and diag.message_primary else str(exc)
     return f"{type(exc).__name__}: {primary}"[:500]
+
+
+# ── Reads (the three download layers) ─────────────────────────
+
+
+def server_now(conn: psycopg.Connection) -> datetime:
+    return conn.execute("SELECT clock_timestamp() AS now").fetchone()["now"]
+
+
+def fetch_rows(conn: psycopg.Connection, table: str, ids: list[str]) -> list[dict]:
+    """Layer 1 (notifications): read the rows a notification pointed at."""
+    spec = TABLES[table]
+    rows = conn.execute(
+        sql.SQL("SELECT * FROM {} WHERE id = ANY(%s::uuid[])").format(sql.Identifier(spec.name)),
+        (ids,),
+    ).fetchall()
+    return [_clean(r) for r in rows]
+
+
+def fetch_tombstones(conn: psycopg.Connection, table: str, ids: list[str]) -> list[str]:
+    rows = conn.execute(
+        "SELECT row_id FROM tombstones WHERE table_name = %s AND row_id = ANY(%s::uuid[])",
+        (table, ids),
+    ).fetchall()
+    return [str(r["row_id"]) for r in rows]
+
+
+def changes_since(
+    conn: psycopg.Connection, table: str, after_ts: datetime, after_id: str, limit: int
+) -> list[dict]:
+    """Layer 2 (catch-up): rows changed after a (timestamp, id) cursor.
+
+    Keyset pagination on (updated_at, id) cannot get stuck when many rows share
+    the same timestamp, which a plain `updated_at > x` cursor would.
+    """
+    spec = TABLES[table]
+    rows = conn.execute(
+        sql.SQL(
+            "SELECT * FROM {} WHERE (updated_at, id) > (%s, %s) ORDER BY updated_at, id LIMIT %s"
+        ).format(sql.Identifier(spec.name)),
+        (after_ts, after_id, limit),
+    ).fetchall()
+    return [_clean(r) for r in rows]
+
+
+def tombstones_since(
+    conn: psycopg.Connection, after_ts: datetime, after_id: str, limit: int
+) -> list[dict]:
+    rows = conn.execute(
+        "SELECT table_name, row_id, deleted_at FROM tombstones "
+        "WHERE (deleted_at, row_id) > (%s, %s) ORDER BY deleted_at, row_id LIMIT %s",
+        (after_ts, after_id, limit),
+    ).fetchall()
+    return [_clean(r) for r in rows]
+
+
+def snapshot(conn: psycopg.Connection) -> dict[str, Any]:
+    """Layer 3 (reconciliation): a consistent copy of every replicated table and
+    all tombstones, plus the server time at which it was taken."""
+    with conn.transaction():
+        conn.execute("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
+        taken_at = server_now(conn)
+        tables = {
+            t: [
+                _clean(r)
+                for r in conn.execute(
+                    sql.SQL("SELECT * FROM {}").format(sql.Identifier(t))
+                ).fetchall()
+            ]
+            for t in REPLICATED_TABLES
+        }
+        tombstones = [
+            _clean(r)
+            for r in conn.execute(
+                "SELECT table_name, row_id, deleted_at FROM tombstones"
+            ).fetchall()
+        ]
+    return {"taken_at": taken_at, "tables": tables, "tombstones": tombstones}
+
+
+def _clean(row: dict) -> dict:
+    """UUIDs as strings, so rows compare equal to what the nodes store."""
+    return {k: (str(v) if isinstance(v, uuid.UUID) else v) for k, v in row.items()}
 
 
 # ── Introspection (demo and tests) ────────────────────────────
