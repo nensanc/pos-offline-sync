@@ -13,3 +13,13 @@ services:
       timeout: 3s
       retries: 30
 
+  # One-command demo: `docker compose run --rm demo`
+  demo:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://possync:possync@db:5432/possync
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["python", "-m", "possync.demo"]
+
