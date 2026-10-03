@@ -23,3 +23,12 @@ services:
         condition: service_healthy
     command: ["python", "-m", "possync.demo"]
 
+  # Test suite against the same database: `docker compose run --rm tests`
+  tests:
+    build: .
+    environment:
+      DATABASE_URL: postgresql://possync:possync@db:5432/possync
+    depends_on:
+      db:
+        condition: service_healthy
+    command: ["python", "-m", "pytest", "-q"]
