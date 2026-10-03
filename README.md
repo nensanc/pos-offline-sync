@@ -233,7 +233,7 @@ This is a focused reimplementation for study and discussion, not a product:
 
 ## Author
 
-**Martin Sanchez** ([@nensanc](https://github.com/nensanc))
+**Martin Sanchez** ([@martinmsanchezm](https://github.com/martinmsanchezm))
 
 ## License
 

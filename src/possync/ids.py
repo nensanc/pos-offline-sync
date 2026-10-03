@@ -11,7 +11,7 @@ converge on one row instead of creating N copies.
 import uuid
 
 # Fixed namespace for this project. Changing it would change every seed id.
-NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "https://github.com/nensanc/pos-offline-sync")
+NAMESPACE = uuid.uuid5(uuid.NAMESPACE_URL, "https://github.com/martinmsanchezm/pos-offline-sync")
 
 
 def new_id() -> str:
